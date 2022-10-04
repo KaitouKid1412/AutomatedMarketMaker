@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: UNLICENSED
+
+pragma solidity ^0.8.14;
+
+import "./interfaces/IERC20.sol";
+import "./interfaces/IUniswapV3MintCallback.sol";
+import "./interfaces/IUniswapV3SwapCallback.sol";
+
+import "./lib/Tick.sol";
+import "./lib/Position.sol";
+import "./lib/TickBitmap.sol";
+import "./lib/Math.sol";
+import "./lib/TickMath.sol";
+import "./lib/SwapMath.sol";
+
+contract UniswapV3Pool{
+
+    using TickBitmap for mapping(uint16 => uint256);
+    using Tick for mapping(int24 => Tick.Info);
+    using Position for mapping(bytes32 => Position.Info);
+    using Position for Position.Info;
+    
+    error InvalidTickRange();
+    error ZeroLiquidity();
+    error InsufficientInputAmount();
+
+    event Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1);
+    event Swap(address indexed sender, address indexed, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick);
+
+    constructor(address token0_, address token1_, uint160 sqrtPriceX96, int24 tick){
+        token0 = token0_;
+        token1 = token1_;
+        slot0 = Slot0({sqrtPriceX96 : sqrtPriceX96, tick : tick});
+    }
+
+    int24 internal constant MIN_TICK = -887272;
+    int24 internal constant MAX_TICK = -MIN_TICK;
+
+    address public immutable token0;
+    address public immutable token1;
+
+    struct CallbackData{
+        address token0;
+        address token1;
+        address payer;
+    }
+
+    struct Slot0 {
+        uint160 sqrtPriceX96;
+        int24 tick;
+    }
+
+    struct SwapState{
+        uint256 amountSpecifiedRemaining;
+        uint256 amountCalculated;
+        uint160 sqrtPriceX96;
+        int24 tick;
+    }
+
+    struct StepState{
+        uint160 sqrtPriceStartX96;
+        int24 nextTick;
+        uint160 sqrtPriceNextX96;
+        uint256 amountIn;
+        uint256 amountOut;
+    }
+
+    Slot0 public slot0;
+
+    uint128 public liquidity;
+
+    mapping(int24 => Tick.Info) public ticks;
+    mapping(bytes32 => Position.Info) public positions;
+    mapping(uint16 => uint256) public tickBitmap;
+
+    function mint(address owner, int24 lowerTick, int24 upperTick, uint128 amount, bytes calldata data) external returns(uint256 amount0, uint256 amount1){
+        if (lowerTick >= upperTick || lowerTick < MIN_TICK || upperTick > MAX_TICK) revert InvalidTickRange();
+
+        if(amount == 0) revert ZeroLiquidity();
+
+        bool flippedLower = ticks.update(lowerTick, amount);
+        bool flippedUpper = ticks.update(upperTick, amount);
+
+        if(flippedLower){
+            tickBitmap.flipTick(lowerTick, 1);
+        }
+        if(flippedUpper){
+            tickBitmap.flipTick(upperTick, 1);
+        }
+
+        Position.Info storage position = positions.get(owner, lowerTick, upperTick);
+        position.update(amount);
+
+        amount0 = Math.calcAmount0Delta(slot0.sqrtPricex96, Math.getSqrtRatioAtTick(upperTick), amount);
+        amount1 = Math.calcAmount0Delta(slot0.sqrtPricex96, Math.getSqrtRatioAtTick(lowerTick), amount);
+
+        uint256 balance0Before;
+        uint256 balance1Before;
+        if(amount > 0) balance0Before = balance0();
+        if(amount > 0) balance1Before = balance1();
+
+        IUniswapV3MintCallback(msg.sender).uniswapV3MintCallback(amount0, amount1, data);
+        
+        if (amount0 > 0 && balance0Before + amount0 > balance0()) revert InsufficientInputAmount();
+        if (amount1 > 0 && balance1Before + amount0 > balance1()) revert InsufficientInputAmount();
+
+        emit Mint(msg.sender, owner, lowerTick, upperTick, amount, amount0, amount1);
+    }
+
+    function swap(address recipient, bool zeroForOne, uint256 amountSpecified, bytes calldata data) public returns(int256 amount0, int256 amount1){
+        Slot0 memory slot0_ = slot0;
+
+        SwapState memory state = SwapState({amountSpecifiedRemaining : amountSpecified, amountCalculated : 0, sqrtPriceX96 : slot0_.sqrtPriceX96, tick : slot0_.tick});
+
+        while(state.amountSpecifiedRemaining > 0){
+            StepState memory step;
+        
+            step.sqrtPriceStartX96 = state.sqrtPriceX96;
+            (step.nextTick,) = tickBitmap.nextInitializedTickWithinOneWord(state.tick, 1, zeroForOne);
+            
+            step.sqrtPriceNextX96= TickMath.getSqrtPriceFromTick(step.nextTick);
+
+            (state.sqrtPriceX96, state.ountIn, state.amountOut) = SwapMath.computeSwapStep(state.sqrtPriceX96, state.sqrtPriceNextX96, liquidity, state.amountSpecifiedRemaining);
+
+            state.amountSpecifiedRemaining -= step.amountIn;
+            state.amountCalculated += step.amountOut;
+            state.tick = Math.geTickAtSqrtRatio(state.sqrtPriceX96);
+        }
+
+        if(state.tick != slot0_.tick){
+            (slot0.sqrtriceX96, slot0.tick) = (state.sqrtPriceX96, state.tick);
+        }
+
+        (amount0, amount1) = zeroForOne ? (int256(amountSpecified - state.amountSpecifiedRemaining), - int256(state.amountCalculated)) : (-int256(state.amountCalculated), int256(amountSpecified - state.amountSpecifiedRemaining));
+
+        if (zeroForOne) {
+            IERC20(token1).transfer(recipient, uint256(-amount1));
+
+            uint256 balance0Before = balance0();
+            IUniswapV3SwapCallback(msg.sender).uniswapV3SwapCallback(amount0, amount1, data);
+
+            if(balance0Before + uint256(amount0) > balance0()) revert InsufficientAmount();
+        }
+        else{
+            IERC20(token0).transfer(recipient, uint256(-amount0));
+
+            uint256 balance1Before = balance1();
+            IUniswapV3SwapCallback(msg.sender).uniswapV3Callback(amount0, amount1, data);
+            if (balance1Before + uint256(amount1) > balance1()) revert InsufficientAmount();
+        }
+
+        emit Swap(msg.sender, recipient, amount0, amount1, slot0.sqrtPriceX96, liquidity, slot0.tick);
+    }
+
+    function balance0() internal returns(uint256 balance){
+        balance = IERC20(token0).balanceOf(address(this));
+    }
+
+    function balance1() internal returns(uint256 balance){
+        balance = IERC20(token1).balanceOf(address(this));
+    }
+}
